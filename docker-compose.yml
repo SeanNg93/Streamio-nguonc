@@ -1,0 +1,13 @@
+services:
+  nguonc-stremio:
+    build: .
+    image: nguonc-stremio
+    container_name: nguonc-stremio
+    restart: unless-stopped
+    # Only reachable from this machine; put nginx/Caddy (HTTPS) in front of it.
+    ports:
+      - "127.0.0.1:7000:7000"
+    # All settings live in .env (copy .env.example to .env and edit it).
+    env_file: .env
+    volumes:
+      - ./data:/app/data

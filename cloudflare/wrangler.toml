@@ -1,0 +1,11 @@
+# Cloudflare Worker: edge relay for HLS video segments.
+# Deploy:   npx wrangler deploy
+# Secret:   npx wrangler secret put EDGE_SECRET   (same value as EDGE_SECRET in .env)
+name = "nguonc-edge"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Run the Worker on your addon hostname, only for /edge/* (must be a proxied, orange-cloud record).
+routes = [
+  { pattern = "stremio.example.com/edge/*", zone_name = "example.com" }
+]
