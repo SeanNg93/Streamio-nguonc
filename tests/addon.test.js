@@ -336,3 +336,104 @@ test('IMDb matcher uses the learned index, persists, and serves stale answers in
   assert.ok(reloaded.matches.has('movie:tt1234567:'));
   assert.ok(reloaded.byImdb.get('tt1234567').has('phim-a'));
 });
+
+test('imdb: anime season-marked entries without ids match by title + season', async () => {
+  const { ImdbMatcher, splitSeason } = require('../src/imdb');
+  assert.deepEqual(splitSeason('Jujutsu Kaisen (Season 2)'), { base: 'jujutsu kaisen', season: 2 });
+  assert.deepEqual(splitSeason('Jujutsu Kaisen 3rd Season'), { base: 'jujutsu kaisen', season: 3 });
+  assert.deepEqual(splitSeason('Chú Thuật Hồi Chiến (Phần 2)'), { base: 'chu thuat hoi chien', season: 2 });
+  assert.equal(splitSeason('Jujutsu Kaisen 0').season, null);
+  const noIds = { imdb: { id: null }, tmdb: { id: null, type: null, season: null } };
+  const films = {
+    s1: { ...noIds, slug: 's1', name: 'Chú Thuật Hồi Chiến (Phần 1)', original_name: 'Jujutsu Kaisen (season 1)', category: { 3: { group: { name: 'Năm' }, list: [{ name: '2020' }] } }, episodes: [{ items: [{ name: '1' }, { name: '2' }] }] },
+    s2: { ...noIds, slug: 's2', name: 'Chú Thuật Hồi Chiến (Phần 2)', original_name: 'Jujutsu Kaisen (Season 2)', category: { 3: { group: { name: 'Năm' }, list: [{ name: '2023' }] } }, episodes: [{ items: [{ name: '1' }, { name: '2' }] }] },
+    s3: { ...noIds, slug: 's3', name: 'Chú Thuật Hồi Chiến: Tử Diệt Hồi Du', original_name: 'Jujutsu Kaisen 3rd Season, Jujutsu Kaisen: Shimetsu Kaiyuu', category: { 3: { group: { name: 'Năm' }, list: [{ name: '2026' }] } }, episodes: [{ items: [{ name: '1' }, { name: '2' }] }] }
+  };
+  const client = { search: async () => ({ items: Object.values(films) }), detail: async (s) => ({ movie: films[s] }) };
+  const videos = [[1, '2020-10-03'], [2, '2023-07-06'], [3, '2026-01-08']].map(([season, released]) => ({ season, episode: 1, released }));
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ meta: { name: 'Jujutsu Kaisen', year: '2020–', videos } }) });
+  const m = new ImdbMatcher({ client, fetchImpl, logger: { log() {}, warn() {} } });
+  assert.deepEqual(await m.resolve('series', 'tt12343534:1:1'), { slug: 's1', episode: 1 });
+  assert.deepEqual(await m.resolve('series', 'tt12343534:2:1'), { slug: 's2', episode: 1 });
+  assert.deepEqual(await m.resolve('series', 'tt12343534:3:2'), { slug: 's3', episode: 2 });
+  assert.equal(await m.resolve('series', 'tt12343534:4:1'), null);
+});
+
+test('pickEpisode: unnumbered specials do not steal positional episode numbers', () => {
+  const { pickEpisode } = require('../src/mapper');
+  const items = ['1', '2', '3', '4', '5', 'Special 1', 'Special 2', '6', '7'].map((name) => ({ name }));
+  assert.equal(pickEpisode(items, 6).name, '6');
+  assert.equal(pickEpisode(items, 7).name, '7');
+  assert.equal(pickEpisode(items, 9), null);
+});
+
+test('imdb: matcher walks later search pages to find a buried TV entry', async () => {
+  const { ImdbMatcher } = require('../src/imdb');
+  const movie = (i) => ({ slug: `m${i}`, name: `One Piece Movie ${i}`, original_name: `One Piece Movie ${i}`, total_episodes: 1 });
+  const tv = { slug: 'one-piece', name: 'One Piece', original_name: 'Đảo Hải Tặc, OP', imdb: { id: 'tt0388629' }, tmdb: { type: 'tv', season: null }, episodes: [{ items: [{ name: '1' }, { name: '2' }] }] };
+  const pages = [[1, 2, 3].map(movie), [4, 5, 6].map(movie), [7, 8, 9].map(movie), [tv]];
+  const asked = [];
+  const client = {
+    search: async (q, n) => { asked.push(n); return { items: pages[n - 1], paginate: { total_page: 4 } }; },
+    detail: async (s) => ({ movie: s === 'one-piece' ? tv : { ...movie(s.slice(1)), slug: s, imdb: { id: null }, tmdb: {} } })
+  };
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ meta: { name: 'One Piece', year: '1999–', videos: [{ season: 1, episode: 1 }] } }) });
+  const m = new ImdbMatcher({ client, fetchImpl, logger: { log() {}, warn() {} } });
+  assert.deepEqual(await m.resolve('series', 'tt0388629:1:2'), { slug: 'one-piece', episode: 2 });
+  assert.ok(asked.includes(4));
+});
+
+test('imdb: upstream search failure is not cached as a miss', async () => {
+  const { ImdbMatcher } = require('../src/imdb');
+  let fail = true;
+  const tv = { slug: 'x', name: 'Show', original_name: 'Show', imdb: { id: 'tt7654321' }, tmdb: { type: 'tv', season: 1 }, episodes: [{ items: [{ name: '1' }] }] };
+  const client = {
+    search: async () => { if (fail) throw new Error('queue full'); return { items: [tv], paginate: { total_page: 1 } }; },
+    detail: async () => ({ movie: tv })
+  };
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ meta: { name: 'Show', year: '2020', videos: [] } }) });
+  const m = new ImdbMatcher({ client, fetchImpl, logger: { log() {}, warn() {} } });
+  assert.equal(await m.resolve('series', 'tt7654321:1:1'), null);
+  assert.equal(m.matches.size, 0);
+  fail = false;
+  assert.deepEqual(await m.resolve('series', 'tt7654321:1:1'), { slug: 'x', episode: 1 });
+});
+
+test('imdb: title season beats a season-less IMDb entry; later arcs and live action lose', async () => {
+  const { ImdbMatcher } = require('../src/imdb');
+  const yr = (y) => ({ 3: { group: { name: 'Năm' }, list: [{ name: String(y) }] } });
+  const eps = (n) => [{ items: Array.from({ length: n }, (_, i) => ({ name: String(i + 1) })) }];
+  const films = {
+    p3: { slug: 'p3', name: 'Dược Sư Tự Sự (Phần 3)', original_name: 'The Apothecary Diaries Season 3', imdb: { id: 'tt1000001' }, tmdb: { type: 'tv', season: null }, category: yr(2026), episodes: eps(12) },
+    p1: { slug: 'p1', name: 'Dược Sư Tự Sự (Phần 1)', original_name: 'Kusuriya no Hitorigoto', imdb: { id: null }, tmdb: {}, category: yr(2023), episodes: eps(24) },
+    arc: { slug: 'arc', name: 'Show Arc', original_name: 'The Apothecary Diaries: Final Arc', imdb: { id: 'tt1000001' }, tmdb: { type: 'tv', season: null }, category: yr(2027), episodes: eps(10) },
+    la: { slug: 'la', name: 'Erased Live Action', original_name: 'Erased', imdb: { id: null }, tmdb: {}, category: yr(2017), episodes: eps(12) },
+    an: { slug: 'an', name: 'Boku dake', original_name: 'Boku dake ga Inai Machi, Erased', imdb: { id: null }, tmdb: {}, category: yr(2016), episodes: eps(12) }
+  };
+  const search = { 'The Apothecary Diaries': ['p3', 'arc'], 'duoc su tu su': ['p3', 'p1'], Erased: ['la', 'an'] };
+  const client = {
+    search: async (q) => ({ items: (search[q] || []).map((s) => films[s]), paginate: { total_page: 1 } }),
+    detail: async (s) => ({ movie: films[s] })
+  };
+  const metas = {
+    tt1000001: { name: 'The Apothecary Diaries', year: '2023–', videos: [[1, '2023-10-22'], [2, '2025-01-10'], [3, '2026-01-01']].map(([season, released]) => ({ season, episode: 1, released })) },
+    tt2000002: { name: 'Erased', year: '2016', videos: [{ season: 1, episode: 1, released: '2016-01-08' }] }
+  };
+  const fetchImpl = async (url) => ({ ok: true, json: async () => ({ meta: metas[/(tt\d+)/.exec(url)[1]] }) });
+  const m = new ImdbMatcher({ client, fetchImpl, logger: { log() {}, warn() {} } });
+  assert.deepEqual(await m.resolve('series', 'tt1000001:1:1'), { slug: 'p1', episode: 1 });
+  assert.deepEqual(await m.resolve('series', 'tt1000001:3:1'), { slug: 'p3', episode: 1 });
+  assert.deepEqual(await m.resolve('series', 'tt2000002:1:1'), { slug: 'an', episode: 1 });
+});
+
+test('streamc 429 pauses all requests to that host until Retry-After', async () => {
+  const { EmbedResolver } = require('../src/streams');
+  EmbedResolver.cooldowns().clear();
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return new Response('{}', { status: 429, headers: { 'retry-after': '120' } }); };
+  const r = new EmbedResolver({ fetchImpl, lookup: async () => [{ address: '1.1.1.1', family: 4 }], enableHttp2: false });
+  assert.equal(await r.fetchText('https://embed9.example-cdn.xyz/a'), null);
+  assert.equal(await r.fetchText('https://embed3.example-cdn.xyz/b'), null);
+  assert.equal(calls, 1);
+  EmbedResolver.cooldowns().clear();
+});

@@ -5,6 +5,7 @@ const { preview, parseMediaId, detailMeta, typeOf } = require('./mapper');
 const { EmbedResolver, buildStreams } = require('./streams');
 const { PlaybackStore } = require('./playback');
 const { ImdbMatcher, parseImdbId } = require('./imdb');
+const { SearchCatalog } = require('./search');
 
 const CATALOGS = [
   { type: 'movie', id: 'nguonc-phim-le', name: 'NguồnC • Phim lẻ', source: 'phim-le' },
@@ -55,6 +56,9 @@ function totalPages(body) {
 function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
                        playback = new PlaybackStore(), logger = console, imdb = null } = {}) {
   imdb ||= new ImdbMatcher({ client, logger });
+  const search = new SearchCatalog({ client, logger,
+    maxPages: Number(process.env.SEARCH_MAX_PAGES) || 18,
+    ttlMs: (Number(process.env.SEARCH_CACHE_SEC) || 90) * 1000 });
   function normalizeResult(items, catalog) {
     const targetType = catalog.type;
     const filtered = catalog.filter ? items.filter((item) => typeOf(item) === targetType) : items;
@@ -69,21 +73,28 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
     const useSearch = !!keyword;
 
     try {
-      if (useSearch || catalog.filter) {
+      if (useSearch) {
+        const result = await search.get(keyword);
+        const metas = normalizeResult(result.items.filter((item) => typeOf(item) === type), catalog)
+          .slice(skip, skip + 15);
+        if (!result.complete && !metas.length) throw new Error('Search results temporarily incomplete');
+        return result.complete ? { metas } : { metas, cacheMaxAge: 0 };
+      }
+      if (catalog.filter) {
         // Walk a bounded number of upstream pages so filtered catalogs use
         // stable Stremio `skip` pagination without duplicated entries.
         const metas = [];
         const pageLimit = 18;
         const target = Math.min(260, skip + 15);
+        let knownPages = 1;
         for (let page = 1; page <= pageLimit && metas.length < target; page++) {
-          // Prefetch the next few pages concurrently; the API client dedupes in-flight requests.
-          const fetchPage = (p) => (useSearch ? client.search(keyword, p) : client.list(catalog.source, p));
-          for (let ahead = page + 1; ahead <= Math.min(pageLimit, page + 4); ahead++) fetchPage(ahead).catch(() => {});
+          const fetchPage = (p) => client.list(catalog.source, p);
           const body = await fetchPage(page);
+          knownPages = Math.min(pageLimit, totalPages(body));
+          for (let ahead = page + 1; ahead <= Math.min(knownPages, page + 2); ahead++) fetchPage(ahead).catch(() => {});
           const batch = listItems(body);
           if (!batch.length) break;
-          const filtered = useSearch ? batch.filter((i) => typeOf(i) === type) : batch;
-          metas.push(...normalizeResult(filtered, catalog));
+          metas.push(...normalizeResult(batch, catalog));
           if (page >= totalPages(body) || batch.length < countPerPage(body)) break;
         }
         return { metas: metas.slice(skip, skip + 15) };
@@ -103,7 +114,7 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
       return { metas: normalizeResult(items, catalog) };
     } catch (error) {
       logger.warn(`[NguonC] catalog ${id}: ${error.message}`);
-      return { metas: [] };
+      throw error; // An upstream failure is not a successful empty catalog.
     }
   }
 

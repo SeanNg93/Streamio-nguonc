@@ -234,7 +234,12 @@ All settings are environment variables (see `.env.example`).
 | `NGUONC_API_BASE` | `https://phim.nguonc.com/api` | upstream API |
 | `API_TIMEOUT_MS` | `9000` | upstream API timeout |
 | `RESOLVE_EMBEDS` | `1` | resolve StreamC players into HLS |
-| `UPSTREAM_PROXY` | empty | HTTP CONNECT proxy with a Vietnamese IP |
+| `UPSTREAM_PROXIES` | empty | `name=url` list of HTTP CONNECT proxies with Vietnamese IPs; fastest healthy one wins, with failover |
+| `UPSTREAM_PROXY` | empty | legacy single proxy (used when `UPSTREAM_PROXIES` is empty) |
+| `PROXY_PROBE_SEC` | `60` | proxy health/latency probe interval |
+| `PROXY_PROBE_URL` | NguonC newest page 1 | URL fetched by the probe |
+| `PROXY_MIN_GAP_MS` | none | per-site request spacing, e.g. `nguonc.com=400,streamc.xyz=800` |
+| `PROXY_429_SEC` | `300` | proxy cooldown after a 429 without `Retry-After` |
 | `UPSTREAM_PROXY_HOSTS` | `nguonc.com,streamc.xyz` | domains sent through the proxy |
 | `STREAMC_HTTP2` | `1` | set `0` when using `UPSTREAM_PROXY` |
 | `EDGE_SECRET` | empty | HMAC secret shared with the Worker; empty disables the edge relay |
@@ -242,12 +247,18 @@ All settings are environment variables (see `.env.example`).
 | `WARM_INTERVAL_MIN` | `8` | background catalog refresh (0 = off) |
 | `WARM_STREAMS` | `10` | pre-resolved top movies per movie catalog |
 | `RESOLVE_CACHE_MIN` | `30` | reuse resolved stream links for N minutes |
+| `API_CONCURRENCY` | `4` | parallel upstream API requests (1..16) |
+| `API_CACHE_MAX` | `3000` | max cached API responses |
+| `SEARCH_MAX_PAGES` | `18` | upstream pages walked per search |
+| `SEARCH_CACHE_SEC` | `90` | ranked search cache lifetime |
 | `PREFETCH_NEXT_EPISODES` | `2` | pre-resolve the next N episodes |
 | `IMDB_MATCH` | `1` | `0` disables the NguonC tab on IMDb titles |
 | `IMDB_CACHE_FILE` | none | where matches and the index are saved |
 | `IMDB_PREFETCH_HOURS` | `3` | popular-title pre-matching interval (0 = off) |
 | `IMDB_INDEX_PAGES` | `20` | newest-upload pages indexed per run |
 | `IMDB_PREFETCH_STREAMS` | `20` | pre-matched titles whose streams are pre-resolved |
+| `IMDB_PREFETCH_DELAY_SEC` | `30` | delay before the first pre-matching run |
+| `IMDB_SEARCH_PAGES` | `8` | upstream search pages tried per title when matching |
 | `CINEMETA_URL` | `https://v3-cinemeta.strem.io` | Cinemeta endpoint |
 
 ---

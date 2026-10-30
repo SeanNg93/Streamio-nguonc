@@ -92,7 +92,7 @@ function serverList(movie) {
     .filter((server) => server.items.length > 0);
 }
 
-function episodeNumber(ep, index) {
+function explicitEpisodeNumber(ep) {
   const label = String(ep?.name || '').trim();
   const slug = String(ep?.slug || '').trim();
   for (const value of [label, slug]) {
@@ -101,7 +101,11 @@ function episodeNumber(ep, index) {
     m = /^0*(\d{1,4})$/.exec(value);
     if (m) return Number(m[1]);
   }
-  return index + 1;
+  return null;
+}
+
+function episodeNumber(ep, index) {
+  return explicitEpisodeNumber(ep) ?? index + 1;
 }
 
 function primaryEpisodeList(movie) {
@@ -110,8 +114,11 @@ function primaryEpisodeList(movie) {
   // More complete server wins. For each number, retain just one entry across servers.
   const primary = [...servers].sort((a, b) => b.items.length - a.items.length)[0];
   const episodeMap = new Map();
-  primary.items.forEach((ep, i) => {
-    const n = episodeNumber(ep, i);
+  // Explicitly numbered items first, so an unnumbered "Special 1" at position 6 cannot take episode 6.
+  const explicitFirst = primary.items.map((ep, i) => ({ ep, i, x: explicitEpisodeNumber(ep) }))
+    .sort((a, b) => (a.x === null) - (b.x === null));
+  explicitFirst.forEach(({ ep, i, x }) => {
+    const n = x ?? i + 1;
     if (n >= 1 && !episodeMap.has(n)) episodeMap.set(n, { number: n, label: ep.name });
   });
   return [...episodeMap.values()].sort((a, b) => a.number - b.number);
@@ -169,8 +176,10 @@ function detailMeta(movie, type, requestedSlug) {
 function pickEpisode(items, wantedNum, isMovie = false) {
   if (!Array.isArray(items) || !items.length) return null;
   if (isMovie) return items.find((it) => /full|tập 1|tap 1/i.test(it.name || '')) || items[0];
-  let match = items.find((it, i) => episodeNumber(it, i) === wantedNum);
-  if (!match && wantedNum > 0 && items.length >= wantedNum) match = items[wantedNum - 1];
+  let match = items.find((it) => explicitEpisodeNumber(it) === wantedNum);
+  if (!match) match = items.find((it, i) => explicitEpisodeNumber(it) === null && i + 1 === wantedNum);
+  if (!match && wantedNum > 0 && items.length >= wantedNum && !items.some((it) => explicitEpisodeNumber(it) !== null))
+    match = items[wantedNum - 1];
   return match || null;
 }
 

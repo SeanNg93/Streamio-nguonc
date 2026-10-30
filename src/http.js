@@ -7,7 +7,7 @@ function sendJson(res, obj, maxAge = 60, status = 200, headOnly = false) {
   const text = JSON.stringify(obj);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': `public, max-age=${maxAge}`,
+    'Cache-Control': maxAge > 0 ? `public, max-age=${maxAge}` : 'no-store',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': '*',
@@ -27,7 +27,7 @@ function createServer(addon, { logger = console } = {}) {
     const head = req.method === 'HEAD';
     const uri = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     if (uri.pathname === '/manifest.json') return sendJson(res, addon.manifest, 3600, 200, head);
-    if (uri.pathname === '/health') return sendJson(res, { ok: true, addon: addon.manifest.name }, 30, 200, head);
+    if (uri.pathname === '/health') return sendJson(res, { ok: true, addon: addon.manifest.name, proxies: require('./egress').getPool()?.status().map(({ url, ...s }) => s) || [] }, 0, 200, head);
     if (uri.pathname === '/') {
       const html = `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NguồnC Stremio</title></head><body style="font:16px system-ui,sans-serif;max-width:650px;margin:64px auto;padding:0 24px;line-height:1.7"><h1>NguồnC — Stremio Addon</h1><p>Addon đang hoạt động.</p><p>Trong Stremio, vào Addons và dán đường dẫn manifest:</p><p><code>${uri.origin.replace(/&/g, '&amp;').replace(/</g,'&lt;')}/manifest.json</code></p><p><a href="/manifest.json">Kiểm tra manifest</a> · <a href="/health">Health</a></p><p>Add-on không lưu trữ nội dung phim.</p></body></html>`;
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options': 'nosniff' });
@@ -55,7 +55,10 @@ function createServer(addon, { logger = console } = {}) {
     if (rawExtra && resource !== 'catalog') return sendJson(res, { error: 'Not found' }, 0, 404, head);
     const extra = Object.fromEntries(new URLSearchParams(rawExtra || uri.search));
     try {
-      if (resource === 'catalog') return sendJson(res, await addon.getCatalog(type, id, extra), 180, 200, head);
+      if (resource === 'catalog') {
+        const { cacheMaxAge = 180, ...body } = await addon.getCatalog(type, id, extra);
+        return sendJson(res, body, cacheMaxAge, 200, head);
+      }
       if (resource === 'meta') return sendJson(res, await addon.getDetail(type, id), 600, 200, head);
       // PUBLIC_BASE_URL is recommended behind a reverse proxy or on cloud hosting.
       const proto = req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';

@@ -139,6 +139,8 @@ async function readLimitedText(response, maxBytes = MAX_HTML) {
   } finally { await reader.cancel().catch(() => {}); }
 }
 
+const COOLDOWN = new Map();   // registrable host -> epoch ms until which we stay quiet
+
 class EmbedResolver {
   constructor({ fetchImpl = (...args) => fetch(...args), lookup = dns.lookup,
                 resolveEmbeds = process.env.RESOLVE_EMBEDS !== '0',
@@ -151,8 +153,14 @@ class EmbedResolver {
     this.cache = new Map();
   }
 
+  static cooldowns() { return COOLDOWN; }
+
   async fetchText(url, { method = 'GET', body = null, headers = {} } = {}) {
     if (!await safeToFetch(url, this.lookup)) return null;
+    // StreamC answers bursts with 429 + Retry-After (~40 min). Hammering it while
+    // limited only extends the ban, so every request to that host waits it out.
+    const host = new URL(url).hostname.split('.').slice(-2).join('.');
+    if ((COOLDOWN.get(host) || 0) > Date.now()) return null;
     const h = {
       'User-Agent': UA,
       'Accept': 'text/html,application/json,application/vnd.apple.mpegurl,*/*',
@@ -168,6 +176,12 @@ class EmbedResolver {
       if (response.ok && response.status < 300) {
         const text = await readLimitedText(response, method === 'GET' ? MAX_PLAYLIST : MAX_HTML);
         return text === null ? null : { status: response.status, text };
+      }
+      if (response.status === 429) {
+        const secs = Math.min(3600, Math.max(30, Number(response.headers.get('retry-after')) || 300));
+        if ((COOLDOWN.get(host) || 0) <= Date.now()) console.warn(`[streamc] 429 from ${host}, pausing ${secs}s`);
+        COOLDOWN.set(host, Date.now() + secs * 1000);
+        return null;
       }
     } catch { /* HTTP/2 fallback for restrictive public embed hosts */ }
     if (!this.enableHttp2 || new URL(url).protocol !== 'https:') return null;

@@ -30,7 +30,7 @@ if (prematchHours > 0 && process.env.IMDB_MATCH !== '0') {
     addon.prematch().then((r) => console.log(`[prematch] indexed +${r.indexed} (total ${r.totalIndexed}), popular ${r.matched}/${r.checked} matched in ${Math.round((Date.now() - started) / 1000)} s`))
       .catch((e) => console.warn(`[prematch] failed: ${e.message}`)).finally(() => { running = false; });
   };
-  setTimeout(runPrematch, 30000).unref();
+  setTimeout(runPrematch, (Number(process.env.IMDB_PREFETCH_DELAY_SEC ?? 30) || 30) * 1000).unref();
   setInterval(runPrematch, prematchHours * 60 * 60 * 1000).unref();
 }
 server.listen(port, '0.0.0.0', () => {
