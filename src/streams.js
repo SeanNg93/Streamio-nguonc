@@ -142,9 +142,13 @@ async function readLimitedText(response, maxBytes = MAX_HTML) {
 const COOLDOWN = new Map();   // registrable host -> epoch ms until which we stay quiet
 
 class EmbedResolver {
+  // The HTTP/2 fallback opens its own TLS sockets, so it would bypass UPSTREAM_PROXY(IES)
+  // and hit geo-blocked hosts from the server IP. With a proxy configured it stays off.
   constructor({ fetchImpl = (...args) => fetch(...args), lookup = dns.lookup,
                 resolveEmbeds = process.env.RESOLVE_EMBEDS !== '0',
-                enableHttp2 = process.env.STREAMC_HTTP2 !== '0', timeoutMs = 8500 } = {}) {
+                enableHttp2 = process.env.STREAMC_HTTP2 !== '0' &&
+                  !process.env.UPSTREAM_PROXIES && !process.env.UPSTREAM_PROXY,
+                timeoutMs = 8500 } = {}) {
     this.fetchImpl = fetchImpl;
     this.lookup = lookup;
     this.resolveEmbeds = resolveEmbeds;

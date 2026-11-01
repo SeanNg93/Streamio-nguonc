@@ -5,3 +5,5 @@ data/
 *.log
 coverage/
 .wrangler/
+__pycache__/
+*.pyc

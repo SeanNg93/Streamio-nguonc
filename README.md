@@ -95,11 +95,13 @@ certbot certonly --webroot -w /var/www/acme -d stremio.example.com
 nginx -t && systemctl reload nginx
 ```
 
-Keep `proxy_buffering off;` so playlists and segments stream immediately.
+Keep `proxy_buffering off;` so playlists and segments stream immediately. Behind Cloudflare, the example's commented `real_ip` lines make the access log show real client IPs, and its log format records request time.
 
 ### 2.4 Install in Stremio
 
 Addons -> paste `https://stremio.example.com/manifest.json` -> Install. Reinstall the addon whenever the manifest changes (new version), because Stremio caches it.
+
+Private addon: set `ACCESS_TOKEN` and install `https://stremio.example.com/<token>/manifest.json` instead; the plain URL then answers 404. Public `/health` only says `ok`; proxy details are shown to direct local requests (`curl http://127.0.0.1:7000/health`).
 
 ---
 
@@ -241,12 +243,12 @@ All settings are environment variables (see `.env.example`).
 | `PROXY_MIN_GAP_MS` | none | per-site request spacing, e.g. `nguonc.com=400,streamc.xyz=800` |
 | `PROXY_429_SEC` | `300` | proxy cooldown after a 429 without `Retry-After` |
 | `UPSTREAM_PROXY_HOSTS` | `nguonc.com,streamc.xyz` | domains sent through the proxy |
-| `STREAMC_HTTP2` | `1` | set `0` when using `UPSTREAM_PROXY` |
+| `STREAMC_HTTP2` | `1` | HTTP/2 fallback for StreamC; always off when a proxy is configured (it would bypass it) |
 | `EDGE_SECRET` | empty | HMAC secret shared with the Worker; empty disables the edge relay |
 | `EDGE_RELAY` | `1` | `0` serves video from the server even if a secret is set |
 | `WARM_INTERVAL_MIN` | `8` | background catalog refresh (0 = off) |
 | `WARM_STREAMS` | `10` | pre-resolved top movies per movie catalog |
-| `RESOLVE_CACHE_MIN` | `30` | reuse resolved stream links for N minutes |
+| `RESOLVE_CACHE_MIN` | `30` | reuse resolved stream links for N minutes (keep above `WARM_INTERVAL_MIN`) |
 | `API_CONCURRENCY` | `4` | parallel upstream API requests (1..16) |
 | `API_CACHE_MAX` | `3000` | max cached API responses |
 | `SEARCH_MAX_PAGES` | `18` | upstream pages walked per search |
@@ -260,6 +262,12 @@ All settings are environment variables (see `.env.example`).
 | `IMDB_PREFETCH_DELAY_SEC` | `30` | delay before the first pre-matching run |
 | `IMDB_SEARCH_PAGES` | `8` | upstream search pages tried per title when matching |
 | `CINEMETA_URL` | `https://v3-cinemeta.strem.io` | Cinemeta endpoint |
+| `ACCESS_TOKEN` | empty | private addon: routes are served under `/<token>/` (install `/<token>/manifest.json`) |
+| `CATALOG_MAX_SKIP` | `200` | deepest catalog `skip`; beyond it the catalog ends |
+| `PLAYBACK_DIR` | empty | persist playback sessions here so `/play/` URLs survive restarts (empty = memory only) |
+| `PLAYBACK_MAX_SESSIONS` | `80` | playback sessions kept in memory (least recently used leave first) |
+| `PLAYBACK_MAX_FILES` | `500` | session files kept in `PLAYBACK_DIR` (expired ones are pruned hourly) |
+| `PLAYBACK_SECRET` | `EDGE_SECRET` | keys the session ids, so the same playlist keeps its id across restarts |
 
 ---
 
@@ -274,7 +282,7 @@ All settings are environment variables (see `.env.example`).
 | Video does not start | fetch the playlist, then one `/edge/...` segment | `403` = EDGE_SECRET mismatch; `502` = CDN refused; try `EDGE_RELAY=0` |
 | After changing code | `npm test` then `docker compose up -d --build` | |
 
-Logs worth knowing: `[warm]` (background refresh), `[prematch]` (IMDb pre-matching), `[imdb]` (cache load), `[play]` (segment proxy errors with the failing host).
+Logs worth knowing: `[warm]` (background refresh), `[prematch]` (IMDb pre-matching), `[imdb]` (cache load), `[play]` (segment proxy errors with the failing host). Background work (warm-up, pre-matching, next-episode prefetch, stale refreshes) waits behind interactive requests for an upstream API slot.
 
 ---
 
@@ -288,7 +296,7 @@ src/egress.js        routes only selected domains through UPSTREAM_PROXY
 src/imdb.js          IMDb -> NguonC matching, index, persistence
 src/streams.js       embed resolution, stream objects
 src/streamc.js       StreamC player/playlist handling
-src/playback.js      HLS playlist proxy, signed edge URLs
+src/playback.js      HLS playlist proxy, persisted sessions, signed edge URLs
 src/http.js          HTTP routes
 cloudflare/          edge relay Worker + wrangler.toml
 relay/relay.py       allowlisted HTTPS relay for a Vietnamese exit IP

@@ -1,9 +1,17 @@
 'use strict';
 
 const { setTimeout: sleep } = require('node:timers/promises');
+const { AsyncLocalStorage } = require('node:async_hooks');
 
 const DEFAULT_API = 'https://phim.nguonc.com/api';
 const TRANSIENT = new Set([429, 500, 502, 503, 504]);
+
+// Work started inside runInBackground() (warm, prematch, next-episode prefetch, stale
+// refreshes) queues behind interactive requests for an API slot, so a user's catalog,
+// search or detail request is not stuck behind a background burst on a slow relay.
+const backgroundContext = new AsyncLocalStorage();
+function runInBackground(fn) { return backgroundContext.run(true, fn); }
+function isBackground() { return backgroundContext.getStore() === true; }
 
 class NguoncApi {
   constructor({ baseUrl = process.env.NGUONC_API_BASE || DEFAULT_API,
@@ -21,7 +29,10 @@ class NguoncApi {
     this.maxQueue = Number.isFinite(maxQueue) ? Math.max(0, Math.min(128, Math.floor(maxQueue))) : 32;
     this.retryDelayMs = retryDelayMs;
     this.failureBackoffMs = failureBackoffMs; this.maxStaleMs = maxStaleMs;
-    this.cache = new Map(); this.inflight = new Map(); this.active = 0; this.queue = [];
+    this.cache = new Map(); this.inflight = new Map(); this.active = 0;
+    this.queue = [];     // interactive waiters (served first)
+    this.bgQueue = [];   // background waiters
+    this.tickets = new Map();   // key -> { waiter } while that request waits for a slot
   }
 
   async get(path, ttlMs = 120000, { fresh = false } = {}) {
@@ -31,12 +42,19 @@ class NguoncApi {
     if (old?.value !== undefined) {
       if (old.until > now) return old.value;
       if (!fresh && now - old.at < this.maxStaleMs) {
-        if (!this.inflight.has(path) && !(old.retryAt > now)) this.fetchFresh(path, ttlMs).catch(() => {});
+        if (!this.inflight.has(path) && !(old.retryAt > now)) {
+          runInBackground(() => this.fetchFresh(path, ttlMs)).catch(() => {});
+        }
         return old.value;
       }
     }
     if (old?.error && old.retryAt > now) throw old.error;
-    return this.inflight.get(path) || this.fetchFresh(path, ttlMs);
+    const pending = this.inflight.get(path);
+    if (pending) {
+      if (!isBackground()) this.promote(path);   // a user now waits for it
+      return pending;
+    }
+    return this.fetchFresh(path, ttlMs);
   }
 
   trimCache() {
@@ -62,28 +80,47 @@ class NguoncApi {
     return promise;
   }
 
-  async acquire(signal) {
+  // Move a background request that an interactive caller joined to the interactive queue.
+  promote(key) {
+    const waiter = this.tickets.get(key)?.waiter;
+    if (!waiter || waiter.queue !== this.bgQueue) return;
+    const index = this.bgQueue.indexOf(waiter);
+    if (index === -1) return;
+    this.bgQueue.splice(index, 1);
+    waiter.queue = this.queue;
+    this.queue.push(waiter);
+  }
+
+  async acquire(signal, key = null) {
     signal.throwIfAborted();
     if (this.active < this.maxConcurrent) { this.active++; return; }
-    if (this.queue.length >= this.maxQueue) throw new Error('NguonC API request queue full');
-    await new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, signal, abort: null };
-      waiter.abort = () => {
-        const index = this.queue.indexOf(waiter);
-        if (index !== -1) this.queue.splice(index, 1);
-        reject(signal.reason);
-      };
-      signal.addEventListener('abort', waiter.abort, { once: true });
-      this.queue.push(waiter);
-    });
+    const queue = isBackground() ? this.bgQueue : this.queue;
+    if (queue.length >= this.maxQueue) throw new Error('NguonC API request queue full');
+    try {
+      await new Promise((resolve, reject) => {
+        const waiter = { resolve, reject, signal, abort: null, queue };
+        waiter.abort = () => {
+          const index = waiter.queue.indexOf(waiter);
+          if (index !== -1) waiter.queue.splice(index, 1);
+          reject(signal.reason);
+        };
+        signal.addEventListener('abort', waiter.abort, { once: true });
+        queue.push(waiter);
+        if (key) this.tickets.set(key, { waiter });
+      });
+    } finally {
+      if (key) this.tickets.delete(key);
+    }
   }
   release() {
-    while (this.queue.length) {
-      const waiter = this.queue.shift();
-      waiter.signal.removeEventListener('abort', waiter.abort);
-      if (waiter.signal.aborted) { waiter.reject(waiter.signal.reason); continue; }
-      waiter.resolve(); // Transfer this slot rather than decrementing/incrementing.
-      return;
+    for (const queue of [this.queue, this.bgQueue]) {
+      while (queue.length) {
+        const waiter = queue.shift();
+        waiter.signal.removeEventListener('abort', waiter.abort);
+        if (waiter.signal.aborted) { waiter.reject(waiter.signal.reason); continue; }
+        waiter.resolve(); // Transfer this slot rather than decrementing/incrementing.
+        return;
+      }
     }
     this.active--;
   }
@@ -91,7 +128,7 @@ class NguoncApi {
   async request(key) {
     // Queue wait, network I/O, and the single retry share one deadline.
     const signal = AbortSignal.timeout(this.timeoutMs);
-    await this.acquire(signal);
+    await this.acquire(signal, key);
     try {
       signal.throwIfAborted();
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -148,4 +185,4 @@ class NguoncApi {
   }
 }
 
-module.exports = { NguoncApi, DEFAULT_API };
+module.exports = { NguoncApi, DEFAULT_API, runInBackground, isBackground };

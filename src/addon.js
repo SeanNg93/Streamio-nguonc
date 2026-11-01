@@ -1,6 +1,6 @@
 'use strict';
 
-const { NguoncApi } = require('./api');
+const { NguoncApi, runInBackground } = require('./api');
 const { preview, parseMediaId, detailMeta, typeOf } = require('./mapper');
 const { EmbedResolver, buildStreams } = require('./streams');
 const { PlaybackStore } = require('./playback');
@@ -65,10 +65,15 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
     return filtered.map((item) => preview(item, targetType)).filter(Boolean);
   }
 
+  // Deepest `skip` served. Beyond it the catalog ends (empty page) instead of repeating
+  // the last page, which made Stremio's endless scroll show the same titles again.
+  const maxSkip = Number(process.env.CATALOG_MAX_SKIP) || 200;
+
   async function getCatalog(type, id, extra = {}) {
     const catalog = CATALOGS.find((c) => c.id === id && c.type === type);
     if (!catalog) return { metas: [] };
-    const skip = Math.min(200, Math.max(0, Number.parseInt(extra.skip, 10) || 0));
+    const skip = Math.max(0, Number.parseInt(extra.skip, 10) || 0);
+    if (skip > maxSkip) return { metas: [] };
     const keyword = String(extra.search || '').trim().slice(0, 120);
     const useSearch = !!keyword;
 
@@ -77,7 +82,11 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
         const result = await search.get(keyword);
         const metas = normalizeResult(result.items.filter((item) => typeOf(item) === type), catalog)
           .slice(skip, skip + 15);
-        if (!result.complete && !metas.length) throw new Error('Search results temporarily incomplete');
+        if (!result.complete && !metas.length) {
+          // A later page past the partial results is just the end for now (not cached).
+          if (skip > 0) return { metas: [], cacheMaxAge: 0 };
+          throw new Error('Search results temporarily incomplete');
+        }
         return result.complete ? { metas } : { metas, cacheMaxAge: 0 };
       }
       if (catalog.filter) {
@@ -85,7 +94,9 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
         // stable Stremio `skip` pagination without duplicated entries.
         const metas = [];
         const pageLimit = 18;
-        const target = Math.min(260, skip + 15);
+        const filteredMax = 260;
+        if (skip >= filteredMax) return { metas: [] };
+        const target = Math.min(filteredMax, skip + 15);
         let knownPages = 1;
         for (let page = 1; page <= pageLimit && metas.length < target; page++) {
           const fetchPage = (p) => client.list(catalog.source, p);
@@ -105,6 +116,7 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
       const size = Math.max(1, Math.min(100, countPerPage(first)));
       const page = Math.floor(skip / size) + 1;
       const offset = skip % size;
+      if (page > totalPages(first)) return { metas: [] };
       const result = page === 1 ? first : await client.list(catalog.source, page);
       const items = listItems(result).slice(offset);
       if (offset > 0 && items.length < size && page < totalPages(result)) {
@@ -124,11 +136,14 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
     try {
       const data = await client.detail(parsed.slug);
       const movie = data?.movie || data?.data?.movie || data;
-      if (!movie?.name) return { meta: null };
+      if (!movie?.name) return { meta: null, cacheMaxAge: 60 };
       return { meta: detailMeta(movie, type, parsed.slug) };
     } catch (error) {
+      // A title NguonC no longer has is a real "no meta". Anything else (timeout, 403,
+      // 429, 5xx) must not be cached by clients as an empty page: let HTTP return 502.
+      if (error.status === 404 || /Invalid film slug/.test(error.message)) return { meta: null, cacheMaxAge: 300 };
       logger.warn(`[NguonC] meta ${parsed.slug}: ${error.message}`);
-      return { meta: null };
+      throw error;
     }
   }
 
@@ -159,11 +174,11 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
       // Watching an episode? Resolve the next ones in the background so "next episode" is instant.
       const ahead = Number(process.env.PREFETCH_NEXT_EPISODES ?? 2);
       if (type === 'series' && !opts.prefetch && ahead > 0) {
-        setTimeout(async () => {
+        setTimeout(() => runInBackground(async () => {
           for (let n = parsed.episode + 1; n <= parsed.episode + ahead; n++) {
             try { await getStreams('series', `nguonc:${parsed.slug}:ep:${n}`, null, { prefetch: true }); } catch {}
           }
-        }, 0).unref?.();
+        }), 0).unref?.();
       }
       return { streams };
     } catch (error) {
