@@ -2,10 +2,11 @@
 
 const { NguoncApi, runInBackground } = require('./api');
 const { preview, parseMediaId, detailMeta, typeOf } = require('./mapper');
-const { EmbedResolver, buildStreams } = require('./streams');
+const { EmbedResolver, buildStreams, hasEpisode } = require('./streams');
 const { PlaybackStore } = require('./playback');
-const { ImdbMatcher, parseImdbId } = require('./imdb');
+const { ImdbMatcher, parseImdbId, splitSeason } = require('./imdb');
 const { SearchCatalog } = require('./search');
+const { createExtraProviders } = require('./providers');
 
 const CATALOGS = [
   { type: 'movie', id: 'nguonc-phim-le', name: 'NguồnC • Phim lẻ', source: 'phim-le' },
@@ -48,14 +49,33 @@ function countPerPage(body) {
   return Number(p.items_per_page || p.itemsPerPage) || listItems(body).length || 12;
 }
 
+// A cached film detail that lacks the requested episode is refetched once it is older
+// than this (new episodes air while the 1 h detail cache still holds the old list).
+const STALE_EPISODE_MS = 120000;
+
+function movieOf(data) { return data?.movie || data?.data?.movie || data; }
+
+// Resolve to { value } or, after ms, to { timedOut: true }; the work itself keeps
+// running (its caches warm up for the next request), it just no longer delays this one.
+function settleWithin(promise, ms) {
+  let timer;
+  // Not unref'd: it is always cleared, and an unref'd race can let the process exit early.
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve({ timedOut: true }), ms); });
+  return Promise.race([Promise.resolve(promise).then((value) => ({ value })), timeout])
+    .finally(() => clearTimeout(timer));
+}
+
 function totalPages(body) {
   const p = pagination(body);
   return Number(p.total_page || p.totalPages) || 999;
 }
 
 function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
-                       playback = new PlaybackStore(), logger = console, imdb = null } = {}) {
+                       playback = new PlaybackStore(), logger = console, imdb = null,
+                       extraProviders = null } = {}) {
   imdb ||= new ImdbMatcher({ client, logger });
+  const providers = Array.isArray(extraProviders) ? extraProviders
+    : createExtraProviders({ fetchImpl: client.fetchImpl, logger });
   const search = new SearchCatalog({ client, logger,
     maxPages: Number(process.env.SEARCH_MAX_PAGES) || 18,
     ttlMs: (Number(process.env.SEARCH_CACHE_SEC) || 90) * 1000 });
@@ -147,31 +167,82 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
     }
   }
 
+  // opts.prefetch marks background pre-resolves (warm, prematch, next-episode prefetch):
+  // NguonC only, no extra providers, no next-episode chaining, no stale-episode refetch.
   async function getStreams(type, id, publicBaseUrl = null, opts = {}) {
-    if (parseImdbId(id)) {
-      // IMDb title from Cinemeta/other catalogs: find the matching NguonC film first.
+    const imdbParsed = parseImdbId(id);
+    if (imdbParsed) {
+      // IMDb title from Cinemeta/other catalogs: NguonC and the extra providers (VSMOV,
+      // KKPhim) run in parallel, each bounded by PROVIDER_STREAM_TIMEOUT_MS.
       if (process.env.IMDB_MATCH === '0') return { streams: [] };
-      try {
-        const match = await imdb.resolve(type, id);
-        if (!match) return { streams: [] };
-        const internal = type === 'series' ? `nguonc:${match.slug}:ep:${match.episode}` : `nguonc:${match.slug}`;
-        return await getStreams(type, internal, publicBaseUrl, opts);
-      } catch (error) {
-        logger.warn(`[NguonC] imdb ${id}: ${error.message}`);
-        return { streams: [] };
+      if (type === 'series' && !imdbParsed.episode) return { streams: [] };
+      const nguoncTask = (async () => {
+        try {
+          const match = await imdb.resolve(type, id);
+          if (!match) return [];
+          const internal = type === 'series' ? `nguonc:${match.slug}:ep:${match.episode}` : `nguonc:${match.slug}`;
+          return (await getStreams(type, internal, publicBaseUrl, opts)).streams;
+        } catch (error) {
+          logger.warn(`[NguonC] imdb ${id}: ${error.message}`);
+          return [];
+        }
+      })();
+      if (opts.prefetch || !providers.length) return { streams: await nguoncTask };
+      const metaPromise = Promise.resolve().then(() => imdb.cinemeta(type, imdbParsed.imdb)).catch(() => null);
+      const localQueries = [];
+      for (const slug of imdb.byImdb?.get?.(imdbParsed.imdb) || []) {
+        const cached = client.cache?.get?.(`/film/${slug}`)?.value;
+        const m = cached?.movie || cached?.data?.movie;
+        const base = splitSeason(m?.name).base;
+        if (base && !localQueries.includes(base)) localQueries.push(base);
       }
+      const extraTasks = providers.map(async (p) => p.streamsForImdb(type, {
+        imdb: imdbParsed.imdb, season: imdbParsed.season, episode: imdbParsed.episode,
+        meta: await metaPromise, localQueries, resolver, playback, publicBaseUrl
+      }));
+      const labels = ['NguonC', ...providers.map((p) => p.label || p.id || 'provider')];
+      const ms = Math.max(100, Number(process.env.PROVIDER_STREAM_TIMEOUT_MS) || 6000);
+      const settled = await Promise.allSettled([nguoncTask, ...extraTasks].map((t) => settleWithin(t, ms)));
+      let partial = false;
+      // Order: NguonC first, then the providers in configured order (VSMOV, KKPhim).
+      const lists = settled.map((r, i) => {
+        if (r.status === 'rejected') {
+          logger.warn(`[streams] ${labels[i]} ${id}: ${r.reason?.message || r.reason}`);
+          return [];
+        }
+        if (r.value.timedOut) {
+          partial = true;
+          logger.warn(`[streams] ${labels[i]} ${id}: no answer within ${ms} ms, skipped`);
+          return [];
+        }
+        return Array.isArray(r.value.value) ? r.value.value : [];
+      });
+      const seen = new Set();
+      const streams = lists.flat().filter((s) => {
+        if (!s?.url || seen.has(s.url)) return false;
+        seen.add(s.url);
+        return true;
+      });
+      // A source that timed out may answer on the next try (its work continues): no caching.
+      return partial ? { streams, cacheMaxAge: 0 } : { streams };
     }
     const parsed = parseMediaId(id);
     if (!parsed) return { streams: [] };
     if (type === 'series' && !parsed.episode) return { streams: [] };
     try {
-      const data = await client.detail(parsed.slug);
-      const movie = data?.movie || data?.data?.movie || data;
+      let movie = movieOf(await client.detail(parsed.slug));
+      if (type === 'series' && !opts.prefetch && !hasEpisode(movie, parsed.episode)) {
+        // The cached detail predates this episode: refetch once (at most every 2 min).
+        const fresher = movieOf(await client.detail(parsed.slug, { fresh: true, maxAgeMs: STALE_EPISODE_MS })
+          .catch((e) => { logger.warn(`[NguonC] refresh ${parsed.slug}: ${e.message}`); return null; }));
+        if (fresher?.episodes) movie = fresher;
+      }
       if (!movie?.episodes) return { streams: [] };
       const streams = await buildStreams(movie, {
         episode: type === 'series' ? parsed.episode : null, resolver, playback, publicBaseUrl
       });
-      // Watching an episode? Resolve the next ones in the background so "next episode" is instant.
+      // Watching an episode? Resolve the next ones in the background so "next episode" is
+      // instant. NguonC ids only, so this never reaches the extra providers.
       const ahead = Number(process.env.PREFETCH_NEXT_EPISODES ?? 2);
       if (type === 'series' && !opts.prefetch && ahead > 0) {
         setTimeout(() => runInBackground(async () => {
@@ -210,9 +281,13 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
     }));
     // Pre-resolve embeds for the top movies (no playback session is created here;
     // the resolver cache makes the real /stream request near-instant).
+    // prefetch: NguonC only (no VSMOV/KKPhim), queued behind interactive API work.
     const movies = [...movieIds];
     await Promise.all(Array.from({ length: 2 }, async () => {
-      while (movies.length) { try { await getStreams('movie', movies.shift(), null); } catch {} }
+      while (movies.length) {
+        const id = movies.shift();
+        try { await runInBackground(() => getStreams('movie', id, null, { prefetch: true })); } catch {}
+      }
     }));
     return { catalogs: CATALOGS.length, details: slugs.size, streams: movieIds.size };
   }
@@ -223,8 +298,12 @@ function createAddon({ client = new NguoncApi(), resolver = new EmbedResolver(),
     const indexed = await imdb.crawlNewest();
     const { checked, found } = await imdb.prefetchPopular();
     const queue = found.slice(0, streams);
+    // prefetch: NguonC only (no VSMOV/KKPhim, no next-episode chain), background priority.
     await Promise.all(Array.from({ length: 2 }, async () => {
-      while (queue.length) { const f = queue.shift(); try { await getStreams(f.type, f.id, null); } catch {} }
+      while (queue.length) {
+        const f = queue.shift();
+        try { await runInBackground(() => getStreams(f.type, f.id, null, { prefetch: true })); } catch {}
+      }
     }));
     return { indexed, totalIndexed: imdb.learned.size, checked, matched: found.length };
   }

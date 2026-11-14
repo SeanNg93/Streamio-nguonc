@@ -22,5 +22,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: vnseg home proxy tests (needs openssl)
+        run: node --test vnseg/test/*.test.js
       - name: python relay compiles
         run: python3 -m py_compile relay/relay.py

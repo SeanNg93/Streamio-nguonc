@@ -13,11 +13,14 @@ Built for Node.js 20+ with one dependency (`undici`). Runs in Docker behind any 
 - **Catalogs:** Phim le, Phim bo, newest movies, newest series, animation/anime, all searchable.
 - **Native playback:** resolves NguonC/StreamC players (including encrypted HLS playlists) into normal HLS that Stremio plays directly. No browser pop-ups.
 - **NguonC tab on IMDb titles:** open any movie or episode from Cinemeta and NguonC streams appear next to your other sources, matched by IMDb id (with a strict title + year fallback) and season.
+- **Extra sources on IMDb titles:** Phim4K (VSMOV, `vsmov.com/api`) and KKPhim (`phimapi.com`) are queried in parallel with NguonC. Each source gets its own time budget (`PROVIDER_STREAM_TIMEOUT_MS`), so a slow source never hides the others, and each keeps its own `bingeGroup` so binge-watching stays on the same source. Turn them off with `EXTRA_PROVIDERS=`.
+- **Disguised segments:** some CDNs hide MPEG-TS behind a fake PNG header (`*.png` segment names). The `/play/` proxy and the Worker strip it before the player sees it.
 - **Fast by design:**
   - catalogs and details cached (stale-while-revalidate) and kept warm in the background,
   - popular Cinemeta titles pre-matched every few hours, matches persisted to disk,
   - next episodes pre-resolved while you watch,
-  - optional **Cloudflare Worker** serves video segments from the edge nearest the viewer.
+  - optional **Cloudflare Worker** serves video segments from the edge nearest the viewer,
+  - optional **home segment proxy** (`vnseg/`) serves NguonC segments from a Vietnamese residential PC through a Cloudflare Tunnel, with automatic fallback to the server.
 - **Geo-block aware:** only NguonC/StreamC requests go through a Vietnamese relay; video never does.
 
 ---
@@ -29,6 +32,8 @@ Built for Node.js 20+ with one dependency (`undici`). Runs in Docker behind any 
 Stremio --HTTPS--> Cloudflare --> your server (nginx -> Docker :7000) --VPN--> VN relay --> NguonC / StreamC
    |
    +--HTTPS--> Cloudflare edge (Worker /edge/*) --> video CDN      (HLS segments, cached at the edge)
+   +--HTTPS--> Cloudflare Tunnel --> home PC (vnseg) --> NguonC CDN (optional, NguonC segments)
+   +--HTTPS--> your server /play/ --> video CDN                    (fallback for everything above)
 ```
 
 | Path | Carries | Why |
@@ -203,10 +208,28 @@ Verify: open a stream playlist (`/stream/movie/<id>.json` -> `url`) and the segm
 
 To switch back to server-side video at any time: `EDGE_RELAY=0`.
 
+Per-CDN exceptions:
+
+- `EDGE_BYPASS_HOSTS=streamc.xyz` keeps sessions whose segment host or referer host ends with one of these suffixes on `/play/`. Use it for CDNs that refuse the Worker. NguonC's segment CDN (behind Cloudflare itself) only answers HTTP/2 clients and treats a Worker subrequest like the viewer's own HTTP version, so HTTP/1.1 players (ffmpeg, mpv, ExoPlayer) get `403` through the edge.
+- `EDGE_IMAGE_SEGMENTS=0` keeps image-named segments (`*.png`, fake PNG header) on `/play/`. By default they go through the Worker, which strips the header.
+- The server fetches video CDNs directly over HTTP/2 (`DIRECT_HTTP2=1`, default), because NguonC's segment CDN rejects HTTP/1.1.
+
 Notes:
 
 - Workers free plan: 100,000 requests/day, about 55 hours of video per day at one request per 2-second segment.
 - Cloudflare's terms discourage serving large volumes of video through its CDN. Fine for personal use; do not run a public service on it.
+
+### 4.3 Home segment proxy for NguonC (optional)
+
+If the edge cannot reach a CDN well (NguonC, see above) and your viewers are in Vietnam, a PC on a Vietnamese home connection can serve those segments instead: `vnseg/vnseg.js` (no dependencies) behind a Cloudflare Tunnel. Setup is in [`vnseg/README.md`](vnseg/README.md). On the addon side:
+
+```ini
+VNSEG_BASE=https://vnseg.example.com
+VNSEG_HOSTS=streamc.xyz
+# VNSEG_SECRET defaults to EDGE_SECRET; it must equal the secret on the home PC.
+```
+
+Matching playlists get absolute `VNSEG_BASE/seg/...` segment URLs (signed with the same HMAC scheme as `/edge/`), and the next few segments are prefetched on the home PC. The addon checks `VNSEG_BASE/health` every `VNSEG_HEALTH_SEC`; after `VNSEG_FAIL_AFTER` failures new playlists fall back to `/play/` until it recovers. `/health` on the addon shows the vnseg state. Leave `VNSEG_BASE` empty to disable it.
 
 ---
 
@@ -268,6 +291,32 @@ All settings are environment variables (see `.env.example`).
 | `PLAYBACK_MAX_SESSIONS` | `80` | playback sessions kept in memory (least recently used leave first) |
 | `PLAYBACK_MAX_FILES` | `500` | session files kept in `PLAYBACK_DIR` (expired ones are pruned hourly) |
 | `PLAYBACK_SECRET` | `EDGE_SECRET` | keys the session ids, so the same playlist keeps its id across restarts |
+| `EDGE_BYPASS_HOSTS` | empty | segment or referer host suffixes kept on `/play/` instead of the Worker, e.g. `streamc.xyz` |
+| `EDGE_IMAGE_SEGMENTS` | `1` | `0` keeps image-named (fake PNG) segments on `/play/` instead of the Worker |
+| `DIRECT_HTTP2` | `1` | direct (non-proxied) fetches may use HTTP/2; NguonC's segment CDN rejects HTTP/1.1 |
+| `EXTRA_PROVIDERS` | `vsmov,kkphim` | extra sources on IMDb titles (comma list; empty = NguonC only) |
+| `PROVIDER_STREAM_TIMEOUT_MS` | `6000` | per-source time budget for one `/stream/` answer; late sources keep resolving for the next request |
+| `PROVIDER_TIMEOUT_MS` | `7500` | timeout of one VSMOV/KKPhim API request |
+| `PROVIDER_CONCURRENCY` | `4` | parallel API requests per extra provider |
+| `VSMOV_API_BASE` | `https://vsmov.com/api` | Phim4K (VSMOV) API |
+| `KKPHIM_API_BASE` | `https://phimapi.com` | KKPhim API |
+| `VNSEG_BASE` | empty | public URL of the home segment proxy (empty = disabled) |
+| `VNSEG_HOSTS` | empty | segment or referer host suffixes sent to vnseg, e.g. `streamc.xyz` |
+| `VNSEG_SECRET` | `EDGE_SECRET` | HMAC secret shared with vnseg |
+| `VNSEG_HEALTH_SEC` | `30` | vnseg health check interval |
+| `VNSEG_HEALTH_TIMEOUT_MS` | `3000` | vnseg health check timeout |
+| `VNSEG_FAIL_AFTER` | `2` | failed checks before falling back to `/play/` |
+| `VNSEG_PREFETCH` | `6` | segments prefetched on vnseg after a playlist is served (0 = off) |
+
+Home segment proxy (`vnseg/vnseg.js`, set on the home PC, not in the addon):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VNSEG_SECRET` | required | same secret as the addon's `VNSEG_SECRET` / `EDGE_SECRET` |
+| `VNSEG_PORT` | `8787` | listen port (always bound to `127.0.0.1`) |
+| `VNSEG_CACHE_MB` | `300` | in-memory segment cache |
+| `VNSEG_HEADER_MS` | `6000` | upstream response header timeout before one retry |
+| `VNSEG_EGRESS_HINT` | empty | free text shown in `/health` (e.g. ISP name) |
 
 ---
 
@@ -279,7 +328,10 @@ All settings are environment variables (see `.env.example`).
 | Catalogs empty | `docker logs nguonc-stremio` shows `NguonC API HTTP 403` | relay missing/offline, or domain not in the relay allowlist |
 | Relay unreachable (curl `000`) | `curl -x http://<relay>:3128 https://phim.nguonc.com/api/...` | relay not running, VPN down, or firewall on the relay machine |
 | No NguonC tab on a title | NguonC may not have it, or the title is not indexed yet | search inside the NguonC catalogs; matches refresh hourly for misses |
-| Video does not start | fetch the playlist, then one `/edge/...` segment | `403` = EDGE_SECRET mismatch; `502` = CDN refused; try `EDGE_RELAY=0` |
+| Video does not start | fetch the playlist, then one `/edge/...` segment | `403` = EDGE_SECRET mismatch; `502` = CDN refused; try `EDGE_RELAY=0` or add the host to `EDGE_BYPASS_HOSTS` |
+| NguonC segments `403` from the server | `docker logs` `[play] asset ... host=` | the CDN needs HTTP/2: keep `DIRECT_HTTP2=1` |
+| vnseg not used | addon `/health` field `vnseg` | `healthy:false` = tunnel or home PC down (playback falls back to `/play/`); check `VNSEG_BASE/health` |
+| Only Phim4K/KKPhim show on first click | normal for a cold NguonC lookup | NguonC keeps resolving in the background; reopen, or raise `PROVIDER_STREAM_TIMEOUT_MS` |
 | After changing code | `npm test` then `docker compose up -d --build` | |
 
 Logs worth knowing: `[warm]` (background refresh), `[prematch]` (IMDb pre-matching), `[imdb]` (cache load), `[play]` (segment proxy errors with the failing host). Background work (warm-up, pre-matching, next-episode prefetch, stale refreshes) waits behind interactive requests for an upstream API slot.
@@ -292,16 +344,20 @@ Logs worth knowing: `[warm]` (background refresh), `[prematch]` (IMDb pre-matchi
 server.js            entry point, background jobs
 src/addon.js         manifest, catalogs, meta, streams, warm-up, pre-matching
 src/api.js           NguonC API client with stale-while-revalidate cache
-src/egress.js        routes only selected domains through UPSTREAM_PROXY
+src/egress.js        routes only selected domains through the VN proxies, HTTP/2 for direct fetches
 src/imdb.js          IMDb -> NguonC matching, index, persistence
 src/streams.js       embed resolution, stream objects
+src/providers.js     Phim4K (VSMOV) and KKPhim sources for IMDb titles
+src/search.js        ranked search across upstream pages
+src/vnseg.js         home segment proxy client: signed URLs, health check, prefetch
 src/streamc.js       StreamC player/playlist handling
 src/playback.js      HLS playlist proxy, persisted sessions, signed edge URLs
 src/http.js          HTTP routes
 cloudflare/          edge relay Worker + wrangler.toml
+vnseg/               home segment proxy (runs on a PC in Vietnam) + its tests
 relay/relay.py       allowlisted HTTPS relay for a Vietnamese exit IP
 deploy/              nginx example
-tests/               node --test suite
+tests/               node --test suite (vnseg server tests: node --test vnseg/test/*.test.js, needs openssl)
 ```
 
 ## License

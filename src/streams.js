@@ -248,18 +248,30 @@ function extractItemUrls(item) {
   return { direct: directMedia(embed), embed };
 }
 
-function streamObject({ url, name, quality, language, referer, proxied = false }) {
+// Provider label -> binge group prefix: fold Vietnamese accents first so 'NguồnC' keeps
+// the original 'nguonc' prefix (binge groups must not change between releases).
+function providerKey(provider) {
+  return String(provider || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/gi, 'd')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+// True when any server of a film detail lists that episode number.
+function hasEpisode(movie, episode) {
+  return serverList(movie).some((server) => !!pickEpisode(server.items, episode, false));
+}
+
+function streamObject({ url, provider = 'NguồnC', name, quality, language, referer, proxied = false, noHeaders = false }) {
   const ref = link(referer) || `${SOURCE_ORIGIN}/`;
   const stream = {
-    name: `NguồnC ${quality || ''}`.trim(),
+    name: `${provider} ${quality || ''}`.trim(),
     title: `${name} • ${language || 'Vietsub'}${quality ? ` • ${quality}` : ''}`,
     url,
     behaviorHints: {
       notWebReady: true,
-      bingeGroup: `nguonc-${name}-${language || 'vietsub'}`.slice(0, 100)
+      bingeGroup: `${providerKey(provider)}-${name}-${language || 'vietsub'}`.slice(0, 100)
     }
   };
-  if (!proxied) {
+  if (!proxied && !noHeaders) {
     stream.behaviorHints.proxyHeaders = {
       request: { 'Referer': ref, 'Origin': new URL(ref).origin, 'User-Agent': UA }
     };
@@ -307,5 +319,6 @@ async function buildStreams(movie, { episode = null, resolver = new EmbedResolve
 
 module.exports = {
   isPrivateIp, isSafeUrl, safeToFetch, directMedia, extractFromHtml,
-  readLimitedText, unpackPacker, EmbedResolver, extractItemUrls, buildStreams
+  readLimitedText, unpackPacker, EmbedResolver, extractItemUrls, streamObject, buildStreams,
+  providerKey, hasEpisode
 };

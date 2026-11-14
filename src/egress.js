@@ -163,6 +163,13 @@ class ProxyPool {
 }
 
 let pool = null;
+// Direct (non-proxied) requests: Node's fetch rides undici's global dispatcher, and loading
+// undici@7 below installs an HTTP/1.1-only Agent there. StreamC's segment CDNs (amass*.top,
+// behind Cloudflare) answer HTTP/1.1 clients with 403 and HTTP/2 clients with 200, so allow h2.
+if (process.env.DIRECT_HTTP2 !== '0') {
+  const { Agent, setGlobalDispatcher } = require('undici');
+  setGlobalDispatcher(new Agent({ allowH2: true }));
+}
 const proxies = parseProxies();
 if (proxies.length) {
   const { ProxyAgent, fetch: undiciFetch } = require('undici');

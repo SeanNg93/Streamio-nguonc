@@ -35,13 +35,17 @@ class NguoncApi {
     this.tickets = new Map();   // key -> { waiter } while that request waits for a slot
   }
 
-  async get(path, ttlMs = 120000, { fresh = false } = {}) {
+  // fresh: never serve a stale (expired) entry. maxAgeMs: also treat an unexpired entry
+  // older than this as expired, so a caller that knows the cached copy is outdated (an
+  // episode missing from a 1 h detail) refetches now instead of waiting for the TTL.
+  async get(path, ttlMs = 120000, { fresh = false, maxAgeMs = null } = {}) {
     if (!/^\/[a-zA-Z0-9_\-/]+(?:\?.*)?$/.test(path) || path.includes('..')) throw new Error('Invalid API path');
     const old = this.cache.get(path);
     const now = Date.now();
     if (old?.value !== undefined) {
-      if (old.until > now) return old.value;
-      if (!fresh && now - old.at < this.maxStaleMs) {
+      const tooOld = Number.isFinite(maxAgeMs) && now - old.at > maxAgeMs;
+      if (old.until > now && !tooOld) return old.value;
+      if (!fresh && !tooOld && now - old.at < this.maxStaleMs) {
         if (!this.inflight.has(path) && !(old.retryAt > now)) {
           runInBackground(() => this.fetchFresh(path, ttlMs)).catch(() => {});
         }
@@ -179,9 +183,9 @@ class NguoncApi {
     return this.get(`/films/search?keyword=${encodeURIComponent(q)}&page=${Math.max(1, Math.floor(page))}`, 90000, options);
   }
 
-  detail(slug) {
+  detail(slug, options = {}) {
     if (!/^[a-z\d_-]{1,150}$/i.test(slug)) throw new Error('Invalid film slug');
-    return this.get(`/film/${slug}`, 3600000);
+    return this.get(`/film/${slug}`, 3600000, options);
   }
 }
 

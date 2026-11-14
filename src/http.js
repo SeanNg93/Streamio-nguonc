@@ -55,7 +55,10 @@ function createServer(addon, { logger = console, accessToken = process.env.ACCES
     if (pathname === '/health') {
       const body = { ok: true, addon: addon.manifest.name };
       // Proxy names, latency and last errors are for the operator only.
-      if (isDirectRequest(req)) body.proxies = require('./egress').getPool()?.status().map(({ url, ...s }) => s) || [];
+      if (isDirectRequest(req)) {
+        body.proxies = require('./egress').getPool()?.status().map(({ url, ...s }) => s) || [];
+        if (addon.playback?.vnseg?.enabled) body.vnseg = addon.playback.vnseg.status();
+      }
       return sendJson(res, body, 0, 200, head);
     }
     if (pathname === '/') {
@@ -104,7 +107,8 @@ function createServer(addon, { logger = console, accessToken = process.env.ACCES
           if (['http:', 'https:'].includes(explicit.protocol)) configuredBase = explicit.origin;
         }
       } catch { /* Fall back to request host. */ }
-      return sendJson(res, await addon.getStreams(type, id, configuredBase), 30, 200, head);
+      const { cacheMaxAge = 30, ...body } = await addon.getStreams(type, id, configuredBase);
+      return sendJson(res, body, cacheMaxAge, 200, head);
     } catch (error) {
       logger.error('[NguonC] request failed:', error);
       return sendJson(res, { error: 'Upstream request failed' }, 0, 502, head);

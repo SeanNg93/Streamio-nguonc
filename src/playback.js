@@ -9,10 +9,27 @@ const { pipeline } = require('node:stream/promises');
 const dns = require('node:dns').promises;
 const { isSafeUrl, safeToFetch } = require('./streams');
 const { UA, MAX_PLAYLIST, decryptHlsManifest } = require('./streamc');
+const { VnsegRelay } = require('./vnseg');
 
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const RESAVE_AFTER_MS = 30 * 60 * 1000;   // persist a sliding expiry at most this often
 const ID_RE = /^[a-f\d]{36}$/;
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+// Some HLS hosts (e.g. VSMOV's *.streamvsmov.com/file/.../file-tiktok_N.png) prepend a
+// small fake PNG header (~500-700 bytes) before the MPEG-TS stream so CDNs cache segments
+// as images. Find the first aligned 0x47 sync byte (verified across 3 packets) and strip
+// the header so native players (Stremio/ffmpeg/mpv) demux H.264/AAC instead of a 1x1 PNG.
+function findTsOffset(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 8) return 0;
+  if (!buf.subarray(0, 8).equals(PNG_MAGIC)) return 0;
+  const limit = Math.min(buf.length - 376, 8192);
+  for (let i = 8; i < limit; i++) {
+    if (buf[i] === 0x47 && buf[i + 188] === 0x47 && buf[i + 376] === 0x47) return i;
+  }
+  const single = buf.indexOf(0x47, 8);
+  return single > 0 ? single : 0;
+}
 
 function resolvePlaylistUrl(raw, baseUrl) {
   try {
@@ -71,7 +88,7 @@ class PlaybackStore {
                 dir = process.env.PLAYBACK_DIR || null, ttlMs = SESSION_TTL_MS,
                 maxFiles = Number(process.env.PLAYBACK_MAX_FILES) || 500,
                 secret = process.env.PLAYBACK_SECRET || process.env.EDGE_SECRET || '',
-                logger = console } = {}) {
+                logger = console, vnseg = undefined } = {}) {
     this.sessions = new Map();   // id -> session, least recently used first
     this.fetchImpl = fetchImpl;
     this.lookup = lookup;
@@ -83,6 +100,8 @@ class PlaybackStore {
     // Without a configured secret ids are still unguessable, just not stable across restarts.
     this.secret = secret || crypto.randomBytes(32).toString('hex');
     this.logger = logger;
+    // Home segment proxy (VNSEG_BASE/VNSEG_HOSTS). null disables; tests inject a stub.
+    this.vnseg = vnseg === undefined ? new VnsegRelay({ logger }) : vnseg;
     this.saveTimers = new Map();
     if (this.dir) {
       this.pruneFiles().catch(() => {});
@@ -223,16 +242,46 @@ class PlaybackStore {
 
   // Media segments go through the Cloudflare edge relay (signed URL, Referer added
   // at the edge) when EDGE_SECRET is set. Playlists, with or without a .m3u8 suffix,
-  // stay here: they may need decrypting and their URIs must be rewritten.
+  // and PNG-disguised MPEG-TS segments (whose fake PNG header must be stripped first)
+  // stay here on /play/.
   edgePath(session, url, { playlist = false } = {}) {
-    const secret = process.env.EDGE_SECRET;
-    if (!secret || process.env.EDGE_RELAY === '0' || playlist) return null;
+    if (playlist) return null;
     let parsed;
     try { parsed = new URL(url); } catch { return null; }
     if (parsed.protocol !== 'https:' || /\.m3u8$/i.test(parsed.pathname)) return null;
+    // Home segment proxy first (absolute URL); takes priority over EDGE_BYPASS_HOSTS while
+    // healthy, and drops out (back to /play/ or the edge) as soon as its health check fails.
+    const home = this.vnseg?.urlFor(session, url);
+    if (home) return home;
+    const secret = process.env.EDGE_SECRET;
+    if (!secret || process.env.EDGE_RELAY === '0') return null;
+    // Image-named segments (StreamC .png, VSMOV PNG-prefixed TS) need the edge worker that
+    // strips fake PNG headers; EDGE_IMAGE_SEGMENTS=0 keeps them on /play/ (VPS strips them).
+    if (process.env.EDGE_IMAGE_SEGMENTS === '0' && /\.(?:png|jpe?g|gif|webp)$/i.test(parsed.pathname)) return null;
+    // EDGE_BYPASS_HOSTS=streamc.xyz,...: CDNs that 403 Cloudflare's Asian colos (StreamC's
+    // amass*.top segment hosts block SIN/VN since 2026-11) stay on /play/ (served from the VPS).
+    const bypass = String(process.env.EDGE_BYPASS_HOSTS || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+    if (bypass.length) {
+      let refHost = '';
+      try { refHost = new URL(session.referer).hostname.toLowerCase(); } catch {}
+      const hit = (host) => bypass.some((h) => host === h || host.endsWith(`.${h}`));
+      if (hit(parsed.hostname.toLowerCase()) || hit(refHost)) return null;
+    }
     const b64 = (v) => Buffer.from(v).toString('base64url');
     const sig = crypto.createHmac('sha256', secret).update(`${url}\n${session.referer}`).digest('hex');
     return `/edge/${b64(url)}/${b64(session.referer)}/${sig}/seg.ts`;
+  }
+
+  // Rewrite a playlist and warm the home proxy with its first segments (fire and forget).
+  renderPlaylist(id, session, text, baseUrl) {
+    const homeUrls = [];
+    const out = rewriteManifest(text, baseUrl, (url, hint) => {
+      const mapped = this.assetPath(id, session, url, hint);
+      if (this.vnseg && !hint.playlist && /^https:/i.test(mapped)) homeUrls.push(mapped);
+      return mapped;
+    });
+    if (out && homeUrls.length) this.vnseg.prefetch(`${id}\n${baseUrl}`, homeUrls);
+    return out;
   }
 
   assetPath(id, session, url, hint = {}) {
@@ -291,8 +340,7 @@ class PlaybackStore {
       res.writeHead(404, this.headers('text/plain').headers); res.end(); return true;
     }
     if (route === 'index.m3u8') {
-      const rewritten = rewriteManifest(session.playlist, session.playlistUrl,
-        (url, hint) => this.assetPath(id, session, url, hint));
+      const rewritten = this.renderPlaylist(id, session, session.playlist, session.playlistUrl);
       if (!rewritten) { res.writeHead(502); res.end(); return true; }
       res.writeHead(200, this.headers('application/vnd.apple.mpegurl').headers);
       res.end(req.method === 'HEAD' ? undefined : rewritten);
@@ -313,26 +361,45 @@ class PlaybackStore {
       if (isHls && req.method !== 'HEAD') {
         let text = await limitedResponseText(response);
         if (text?.includes('#ENC-AESGCM')) text = decryptHlsManifest(text, session.videoHash);
-        const normalized = rewriteManifest(text, target, (uri, hint) => this.assetPath(id, session, uri, hint));
+        const normalized = this.renderPlaylist(id, session, text, target);
         if (!normalized) { res.writeHead(502); res.end(); return true; }
         res.writeHead(200, this.headers('application/vnd.apple.mpegurl').headers);
         res.end(normalized);
         return true;
       }
+      const isDisguisedTs = /\.(?:png|jpe?g|gif|webp)(?:$|\?)/i.test(target) || /^image\//i.test(contentType);
       const responseHeaders = {};
       for (const key of ['content-length', 'content-range', 'etag', 'last-modified']) {
+        if (isDisguisedTs && (key === 'content-length' || key === 'content-range')) continue;
         const value = response.headers.get(key);
         if (value) responseHeaders[key] = value;
       }
-      const status = response.status === 206 ? 206 : 200;
-      res.writeHead(status, this.headers(contentType, status, responseHeaders).headers);
+      const status = response.status === 206 && !isDisguisedTs ? 206 : 200;
+      res.writeHead(status, this.headers(isDisguisedTs ? 'video/mp2t' : contentType, status, responseHeaders).headers);
       if (req.method === 'HEAD' || !response.body) { res.end(); return true; }
       let count = 0;
+      let headBuf = isDisguisedTs ? Buffer.alloc(0) : null;
       const limiter = new Transform({
         transform(chunk, _encoding, callback) {
           count += chunk.byteLength;
-          if (count > 64 * 1024 * 1024) callback(new Error('Asset size limit exceeded'));
-          else callback(null, chunk);
+          if (count > 64 * 1024 * 1024) return callback(new Error('Asset size limit exceeded'));
+          if (headBuf !== null) {
+            headBuf = Buffer.concat([headBuf, Buffer.from(chunk)]);
+            if (headBuf.length < 4096) return callback();
+            const offset = findTsOffset(headBuf);
+            const slice = headBuf.subarray(offset);
+            headBuf = null;
+            return callback(null, slice);
+          }
+          callback(null, chunk);
+        },
+        flush(callback) {
+          if (headBuf !== null && headBuf.length) {
+            const offset = findTsOffset(headBuf);
+            this.push(headBuf.subarray(offset));
+            headBuf = null;
+          }
+          callback();
         }
       });
       await pipeline(Readable.fromWeb(response.body), limiter, res);
@@ -346,4 +413,4 @@ class PlaybackStore {
   }
 }
 
-module.exports = { PlaybackStore, rewriteManifest, limitedResponseText };
+module.exports = { PlaybackStore, rewriteManifest, limitedResponseText, findTsOffset };
